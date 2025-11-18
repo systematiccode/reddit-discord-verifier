@@ -1,22 +1,17 @@
-import 'dotenv/config';
+// index.js – strict two-way verify: reddit name + Discord username/globalName must match
+// parses content from embeds + content
+// adds Reddit profile link on success
+// adds !reddit command usable in any channel (except modmail)
+// verify channel: only !verify allowed, other messages deleted
+// verify channel: slowmode applied on startup
+
+import dotenv from 'dotenv';
+dotenv.config();
+
 import {
   Client,
   GatewayIntentBits,
-  Partials,
-  Events,
 } from 'discord.js';
-
-const {
-  DISCORD_TOKEN,
-  GUILD_ID,
-  WATCH_CHANNEL_ID,
-  ROLE_ID,
-} = process.env;
-
-if (!DISCORD_TOKEN || !GUILD_ID || !WATCH_CHANNEL_ID || !ROLE_ID) {
-  console.error('❌ Missing env vars: DISCORD_TOKEN, GUILD_ID, WATCH_CHANNEL_ID, ROLE_ID');
-  process.exit(1);
-}
 
 const client = new Client({
   intents: [
@@ -25,25 +20,65 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
   ],
-  partials: [Partials.Channel],
 });
 
-// Helper: extract all visible text (content + embeds)
-function getMessageText(message) {
-  let parts = [];
+// ---- Config ----
 
-  if (message.content) {
+const GUILD_ID = process.env.GUILD_ID;
+const MODMAIL_CHANNEL_ID = process.env.WATCH_CHANNEL_ID;              // forwarded modmail channel
+const VERIFY_CHANNEL_ID = process.env.VERIFY_COMMAND_CHANNEL_ID;      // !verify channel
+const ROLE_ID = process.env.ROLE_ID;
+const LOOKBACK_HOURS = Number(process.env.MODMAIL_LOOKBACK_HOURS || '12');
+// slowmode in seconds for verify channel
+const VERIFY_SLOWMODE_SECONDS = Number(process.env.VERIFY_SLOWMODE_SECONDS || '30');
+
+// ---- Helpers ----
+
+function normalize(str) {
+  return (str || '').trim().toLowerCase();
+}
+
+// Strip simple markdown like **text** and [**text**](url)
+function stripMarkdown(str) {
+  if (!str) return str;
+
+  // Remove surrounding ** **
+  str = str.replace(/^\*{1,2}/, '').replace(/\*{1,2}$/, '');
+
+  // Remove basic markdown link wrapper: [**name**](...)
+  const linkMatch = str.match(/^\[([^\]]+)\]\([^)]+\)$/);
+  if (linkMatch) {
+    str = linkMatch[1];
+  }
+
+  // Strip ** again inside link text
+  str = str.replace(/^\*{1,2}/, '').replace(/\*{1,2}$/, '');
+  return str.trim();
+}
+
+/**
+ * Build a unified text representation from:
+ * - message.content
+ * - all embed descriptions
+ * - all embed fields as "Name: Value"
+ */
+function buildFullTextFromMessage(message) {
+  const parts = [];
+
+  if (message.content && message.content.trim().length > 0) {
     parts.push(message.content);
   }
 
   if (message.embeds && message.embeds.length > 0) {
     for (const embed of message.embeds) {
-      if (embed.title) parts.push(embed.title);
-      if (embed.description) parts.push(embed.description);
+      if (embed.description) {
+        parts.push(embed.description);
+      }
       if (embed.fields && embed.fields.length > 0) {
         for (const field of embed.fields) {
-          if (field.name) parts.push(field.name);
-          if (field.value) parts.push(field.value);
+          const name = field.name || '';
+          const value = field.value || '';
+          parts.push(`${name}: ${value}`);
         }
       }
     }
@@ -52,179 +87,349 @@ function getMessageText(message) {
   return parts.join('\n');
 }
 
-// Helper: strip basic Markdown / formatting from text
-function stripFormatting(text) {
-  if (!text) return '';
+/**
+ * Parse forwarded modmail message into:
+ * { redditName, discordName, status }
+ *
+ * We now expect the combined text from buildFullTextFromMessage(message)
+ */
+function parseModmailMessageFromFullText(fullText) {
+  const rawLines = fullText.split('\n');
+  const lines = rawLines.map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return null;
 
-  return text
-    // [**Hermit_Toad**](https://...) -> **Hermit_Toad**
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    // **bold** -> bold
-    .replace(/\*\*/g, '')
-    // inline code `foo` -> foo
-    .replace(/`/g, '')
-    .trim();
+  // Ignore pure "✅ Linked Reddit..." or bot log lines
+  if (lines[0].startsWith('✅ Linked Reddit') || lines[0].startsWith("I couldn't find a member")) {
+    return null;
+  }
+
+  // 1) Author line → reddit name
+  const authorLine = lines.find(line => line.toLowerCase().startsWith('author:'));
+  let redditName = null;
+  if (authorLine) {
+    let namePart = authorLine.replace(/^author:\s*/i, '').trim();
+    namePart = stripMarkdown(namePart);
+    redditName = namePart || null;
+  }
+
+  // Fallback: if no Author line, use first non-empty line
+  if (!redditName) {
+    redditName = stripMarkdown(lines[0]);
+  }
+
+  // 2) Body line → Discord name (username/global)
+  const bodyLine = lines.find(line => line.toLowerCase().startsWith('body:'));
+  let discordName = null;
+  if (bodyLine) {
+    let bodyPart = bodyLine.replace(/^body:\s*/i, '').trim();
+    bodyPart = stripMarkdown(bodyPart);
+
+    // Match "Register Discord with Discord ID: something"
+    // or "Verify Discord: something"
+    const match = bodyPart.match(/discord(?:\s+with\s+discord\s+id)?:\s*([^\s]+)/i);
+    if (match) {
+      discordName = match[1].trim();
+    }
+  }
+
+  // 3) Status line → status
+  const statusLine = lines.find(line => line.toLowerCase().startsWith('status:'));
+  let status = 'Unknown';
+  if (statusLine) {
+    const parts = statusLine.split(':');
+    status = (parts[1] || '').trim() || 'Unknown';
+  }
+
+  if (!redditName || !discordName) {
+    console.log('⚠️ parseModmailMessage: Missing redditName or discordName. Full text was:');
+    console.log(fullText);
+    return null;
+  }
+
+  return {
+    redditName,
+    discordName,
+    status,
+  };
 }
 
-client.once(Events.ClientReady, (c) => {
-  console.log(`✅ Logged in as ${c.user.tag}`);
-});
+/**
+ * Find latest matching modmail within LOOKBACK_HOURS
+ * Conditions:
+ *  - redditName matches redditNameInput
+ *  - discordName matches the user who typed !verify (username or globalName)
+ *  - status is not banned
+ */
+async function findMatchingModmail(modmailChannel, redditNameInput, member, lookbackHours) {
+  const cutoff = Date.now() - lookbackHours * 60 * 60 * 1000;
+  const targetReddit = normalize(redditNameInput);
 
-client.on(Events.MessageCreate, async (message) => {
-  try {
-    if (!message.guild) return;
-    if (message.channel.id !== WATCH_CHANNEL_ID) return;
-    if (message.author.id === client.user.id) return;
+  const username = normalize(member.user.username);              // main username
+  const globalName = normalize(member.user.globalName || '');    // global display name if set
 
-    const rawText = getMessageText(message);
-    const content = stripFormatting(rawText);
+  let lastId = undefined;
+  let scanned = 0;
+  const MAX_SCANNED = 500;
 
-    console.log('--- RAW TEXT I SEE ---');
-    console.log(rawText);
-    console.log('--- STRIPPED TEXT I USE ---');
-    console.log(content);
-    console.log('-----------------------------');
+  while (true) {
+    const batch = await modmailChannel.messages.fetch({
+      limit: 100,
+      ...(lastId ? { before: lastId } : {}),
+    });
 
-    // 0) Check Status line — skip if Status: Banned
-    // After stripping, this should look like: Status: Active  / Status: Banned
-    const statusMatch = content.match(/Status:\s*([^\n\r]+)/i);
-    if (statusMatch) {
-      const statusValue = statusMatch[1].trim().toLowerCase();
-      if (statusValue.includes('banned')) {
-        console.log('⛔ Status is Banned, ignoring this verification.');
-        return;
+    if (batch.size === 0) break;
+
+    // Newest → oldest
+    for (const msg of batch.values()) {
+      scanned++;
+      if (scanned > MAX_SCANNED) {
+        console.log('🔎 Reached max scanned messages');
+        return null;
       }
-    }
 
-    // 1) Parse Reddit username
-    // Prefer Participant: line if present, else Author:, else first line
-    let redditUser = null;
-
-    const participantMatch = content.match(/Participant:\s*([^\n\r]+)/i);
-    if (participantMatch) {
-      redditUser = participantMatch[1].trim();
-    } else {
-      const authorMatch = content.match(/Author:\s*([^\n\r]+)/i);
-      if (authorMatch) {
-        redditUser = authorMatch[1].trim();
+      if (msg.createdTimestamp < cutoff) {
+        console.log(`🔎 Stopping at messages older than ${lookbackHours} hours`);
+        return null;
       }
-    }
 
-    let fallbackRedditUser = null;
-    const firstLineMatch = content.match(/^([^\n\r]+)/);
-    if (firstLineMatch) {
-      fallbackRedditUser = firstLineMatch[1].trim();
-    }
+      const fullText = buildFullTextFromMessage(msg);
+      const parsed = parseModmailMessageFromFullText(fullText);
+      if (!parsed) continue;
 
-    const finalRedditUser = redditUser || fallbackRedditUser || 'RedditUser';
+      const { redditName, discordName, status } = parsed;
+      const parsedReddit = normalize(redditName);
+      const parsedDiscord = normalize(discordName);
 
-    // 2) Parse Discord username from the Body line
-    // Now stripped, it should look like:
-    // Body: Register Discord with Discord ID: pikachucatcher88
-    // or:
-    // Body: Verify Discord: someName
+      if (status && status.toLowerCase().includes('banned')) {
+        continue;
+      }
 
-    let discordName = null;
+      if (parsedReddit !== targetReddit) continue;
 
-    const verifyMatch = content.match(
-      /Body:\s*Verify Discord:\s*([^\s]+)/i
-    );
+      let discordMatches = false;
+      if (parsedDiscord === username) {
+        discordMatches = true;
+      } else if (globalName && parsedDiscord === globalName) {
+        discordMatches = true;
+      }
 
-    const registerMatch = content.match(
-      /Body:\s*Register Discord with Discord ID:\s*([^\s]+)/i
-    );
-
-    if (verifyMatch) {
-      discordName = verifyMatch[1].trim();
-    } else if (registerMatch) {
-      discordName = registerMatch[1].trim();
-    }
-
-    if (!discordName) {
-      console.log('No matching "Verify Discord" or "Register Discord" line found, skipping.');
-      return;
-    }
-
-    console.log(`Detected Reddit user: ${finalRedditUser} | Discord name: ${discordName}`);
-
-    const guild = message.guild;
-
-    // 3) Try to find the member by username or display name
-    let targetMember =
-      guild.members.cache.find(
-        (m) =>
-          m.user.username.toLowerCase() === discordName.toLowerCase() ||
-          (m.displayName && m.displayName.toLowerCase() === discordName.toLowerCase())
-      ) || null;
-
-    // If not in cache, try a broader fetch by query
-    if (!targetMember) {
-      try {
-        const fetched = await guild.members.fetch({
-          query: discordName,
-          limit: 10,
-        });
-
-        targetMember = fetched.find(
-          (m) =>
-            m.user.username.toLowerCase() === discordName.toLowerCase() ||
-            (m.displayName && m.displayName.toLowerCase() === discordName.toLowerCase())
+      if (!discordMatches) {
+        console.log(
+          `❌ Discord mismatch for u/${redditName}: ` +
+          `modmailName=${discordName}, user.username=${member.user.username}, ` +
+          `user.globalName=${member.user.globalName}`
         );
-
-        if (!targetMember && fetched.size > 0) {
-          console.log('No exact match, using first fetched member as fallback.');
-          targetMember = fetched.first();
-        }
-      } catch (err) {
-        console.error('Error fetching members:', err);
+        continue;
       }
+
+      console.log(`✅ Found latest matching modmail for u/${redditName} and ${member.user.tag}`);
+      return { parsed, message: msg };
     }
 
-    if (!targetMember) {
-      console.warn(`⚠️ Could not find a member matching "${discordName}" in the guild.`);
-      await message.reply(
-        `I couldn't find a member with the name \`${discordName}\`. Please check their Discord username / display name.`
-      ).catch(() => {});
-      return;
-    }
+    lastId = batch.last().id;
+  }
 
-    console.log(`Found member: ${targetMember.user.tag}`);
+  return null;
+}
 
-    // 4) Get the role
-    const role = guild.roles.cache.get(ROLE_ID);
-    if (!role) {
-      console.error('❌ Role not found, check ROLE_ID');
-      return;
-    }
+// ---- Handle !verify ----
 
-    // 5) Assign the role
-    if (!targetMember.roles.cache.has(ROLE_ID)) {
-      try {
-        await targetMember.roles.add(role, 'Verified via Reddit modmail');
-        console.log(`✅ Added role ${role.name} to ${targetMember.user.tag}`);
-      } catch (err) {
-        console.error(`Failed to add role to ${targetMember.user.tag}:`, err);
-      }
-    } else {
-      console.log(`Member ${targetMember.user.tag} already has role ${role.name}`);
-    }
+async function handleVerifyCommand(message) {
+  const args = message.content.trim().split(/\s+/);
+  if (args.length < 2) {
+    await message.reply('❌ Usage: `!verify <reddit_username>` or `!verify u/<reddit_username>`');
+    return;
+  }
 
-    // 6) Set nickname to "Reddit | Discord"
-    const newNick = `${finalRedditUser} | ${discordName}`;
-    try {
-      await targetMember.setNickname(newNick, 'Set from Reddit verification');
-      console.log(`✅ Set nickname of ${targetMember.user.tag} → ${newNick}`);
-    } catch (err) {
-      console.error(`Failed to set nickname for ${targetMember.user.tag}:`, err);
-    }
+  let redditNameInput = args[1];
 
-    // Optional feedback message
+  // Allow !verify u/RedditName
+  if (redditNameInput.toLowerCase().startsWith('u/')) {
+    redditNameInput = redditNameInput.substring(2);
+  }
+
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) {
+    await message.reply('⚠️ I cannot find the guild. Please contact an admin.');
+    return;
+  }
+
+  const modmailChannel = await client.channels.fetch(MODMAIL_CHANNEL_ID).catch(() => null);
+  if (!modmailChannel || !modmailChannel.isTextBased()) {
+    await message.reply('⚠️ Modmail channel is misconfigured. Please contact an admin.');
+    return;
+  }
+
+  const member = message.member;
+  if (!member) {
+    await message.reply('⚠️ Could not resolve your member info. Try again or contact mods.');
+    return;
+  }
+
+  await message.reply(
+    `🔎 Searching last **${LOOKBACK_HOURS} hours** for a valid modmail for **u/${redditNameInput}** sent with your Discord name...`
+  );
+
+  const match = await findMatchingModmail(modmailChannel, redditNameInput, member, LOOKBACK_HOURS);
+
+  if (!match) {
     await message.reply(
-      `✅ Linked Reddit **${finalRedditUser}** to Discord **${targetMember.user.tag}** and assigned role **${role.name}**.`
-    ).catch(() => {});
+      `❌ I couldn't find a recent modmail that links **u/${redditNameInput}** to **your Discord username/global name** within the last **${LOOKBACK_HOURS} hours**.\n\n` +
+      `Please:\n` +
+      `1. Send a modmail in the exact format:\n` +
+      `   \`Register Discord with Discord ID: ${member.user.username}\`\n` +
+      `2. If you use a global display name, you can also use that instead.\n` +
+      `3. Wait a few minutes, then run \`!verify ${redditNameInput}\` again in this channel.`
+    );
+    return;
+  }
+
+  const { parsed } = match;
+  const { redditName, discordName, status } = parsed;
+
+  if (status && status.toLowerCase().includes('banned')) {
+    await message.reply(
+      `🚫 There is a modmail entry for **u/${redditName}**, but the status is **${status}**.\n` +
+      `Verification cannot proceed. Please contact the mod team if you believe this is a mistake.`
+    );
+    return;
+  }
+
+  // Assign role
+  try {
+    await member.roles.add(ROLE_ID);
+    console.log(`✅ Added role ${ROLE_ID} to ${member.user.tag}`);
   } catch (err) {
-    console.error('Error in MessageCreate handler:', err);
+    console.error('❌ Failed to add role:', err);
+    await message.reply(
+      `⚠️ I found a valid modmail for **u/${redditName}**, but I couldn't add the role (missing permissions or role order issue).\n` +
+      `Please contact a moderator.`
+    );
+    return;
+  }
+
+  // Set nickname
+  const newNick = `${redditName} | ${member.user.username}`;
+  try {
+    await member.setNickname(newNick);
+    console.log(`✅ Set nickname of ${member.user.tag} → ${newNick}`);
+  } catch (err) {
+    console.error('⚠️ Failed to set nickname:', err);
+    // Not fatal
+  }
+
+  const redditProfileUrl = `https://www.reddit.com/u/${redditName}`;
+
+  await message.reply(
+    `✅ Successfully verified **u/${redditName}** ↔ **${member.user.username}**.\n` +
+    `🔗 Reddit profile: <${redditProfileUrl}>\n` +
+    `Modmail Discord ID on file: **${discordName}**\n` +
+    `Role assigned and nickname updated. Welcome!`
+  );
+}
+
+// ---- Handle !reddit ----
+
+async function handleRedditCommand(message) {
+  // !reddit or !reddit @User
+  const mentioned = message.mentions.members.first();
+  let targetMember;
+
+  if (mentioned) {
+    targetMember = mentioned;
+  } else {
+    // self-lookup if no mention
+    targetMember = message.member;
+  }
+
+  if (!targetMember) {
+    await message.reply('❌ Could not resolve that user.');
+    return;
+  }
+
+  const nickname = targetMember.displayName; // we set this to "RedditName | DiscordName"
+  if (!nickname || !nickname.includes('|')) {
+    await message.reply('❌ That user does not have a Reddit-linked nickname.');
+    return;
+  }
+
+  const redditNameRaw = nickname.split('|')[0].trim();
+  const redditName = redditNameRaw.toLowerCase().startsWith('u/')
+    ? redditNameRaw.slice(2)
+    : redditNameRaw;
+
+  const url = `https://www.reddit.com/u/${redditName}`;
+
+  await message.reply(
+    `🔗 Reddit profile for **${redditName}** (looked up from nickname \`${nickname}\`):\n<${url}>`
+  );
+}
+
+// ---- Events ----
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  const contentLower = message.content.trim().toLowerCase();
+
+  // Modmail channel: just log, no commands
+  if (message.channelId === MODMAIL_CHANNEL_ID) {
+    console.log('📨 Modmail forward received (stored for verification scan).');
+    return;
+  }
+
+  // !reddit command – allowed in any channel (except modmail)
+  if (contentLower.startsWith('!reddit')) {
+    try {
+      await handleRedditCommand(message);
+    } catch (err) {
+      console.error('❌ Error handling !reddit:', err);
+      await message.reply('⚠️ Something went wrong while looking up Reddit profile.');
+    }
+    return;
+  }
+
+  // Verify channel: delete any non-!verify messages
+  if (message.channelId === VERIFY_CHANNEL_ID) {
+    if (!contentLower.startsWith('!verify')) {
+      try {
+        await message.delete();
+        console.log(`🧹 Deleted non-verify message from ${message.author.tag} in verify channel.`);
+      } catch (err) {
+        console.error('⚠️ Failed to delete message in verify channel:', err);
+      }
+      return;
+    }
+
+    // Handle !verify in verify channel
+    try {
+      await handleVerifyCommand(message);
+    } catch (err) {
+      console.error('❌ Error handling !verify:', err);
+      await message.reply('⚠️ Something went wrong while verifying. Please try again or contact a mod.');
+    }
+    return;
   }
 });
 
-client.login(DISCORD_TOKEN);
+client.once('clientReady', async () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+  console.log(`⏳ Lookback window: ${LOOKBACK_HOURS} hours`);
+
+  // Apply slowmode to verify channel
+  try {
+    const verifyChannel = await client.channels.fetch(VERIFY_CHANNEL_ID);
+    if (verifyChannel && verifyChannel.isTextBased()) {
+      await verifyChannel.setRateLimitPerUser(VERIFY_SLOWMODE_SECONDS);
+      console.log(
+        `🐢 Set slowmode for verify channel (${verifyChannel.id}) to ${VERIFY_SLOWMODE_SECONDS} seconds.`
+      );
+    } else {
+      console.log('⚠️ Could not apply slowmode: verify channel not found or not text-based.');
+    }
+  } catch (err) {
+    console.error('⚠️ Failed to set slowmode on verify channel:', err);
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
