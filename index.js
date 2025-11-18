@@ -1,10 +1,9 @@
 // index.js – Reddit ↔ Discord verification bot
-// - Strict two-way verification: Reddit name + Discord username/globalName must match
-// - Parses content from embeds + content
-// - Adds Reddit profile link on success
-// - Adds !reddit command usable in any channel (except modmail)
-// - Verify channel: only !verify allowed, other messages deleted
-// - Verify channel: slowmode applied on startup
+// - Two-way verification using forwarded Reddit modmail
+// - Confirms Reddit name + Discord username/global name
+// - Assigns role + sets nickname
+// - Supports !verify and !reddit
+// - Cleans verify channel and enforces slowmode
 
 import dotenv from 'dotenv';
 dotenv.config();
@@ -43,7 +42,7 @@ const client = new Client({
   ],
 });
 
-// ---- Config ----
+// ---- Config from env ----
 
 const GUILD_ID = process.env.GUILD_ID;
 const MODMAIL_CHANNEL_ID = process.env.WATCH_CHANNEL_ID;              // forwarded modmail channel
@@ -71,7 +70,7 @@ function stripMarkdown(str) {
     str = linkMatch[1];
   }
 
-  // Strip ** again inside link text
+  // Strip ** again in link text
   str = str.replace(/^\*{1,2}/, '').replace(/\*{1,2}$/, '');
   return str.trim();
 }
@@ -111,14 +110,14 @@ function buildFullTextFromMessage(message) {
  * Parse forwarded modmail message into:
  * { redditName, discordName, status }
  *
- * We now expect the combined text from buildFullTextFromMessage(message)
+ * We pass in the combined text: content + embeds
  */
 function parseModmailMessageFromFullText(fullText) {
   const rawLines = fullText.split('\n');
   const lines = rawLines.map(l => l.trim()).filter(Boolean);
   if (!lines.length) return null;
 
-  // Ignore pure "✅ Linked Reddit..." or bot log lines
+  // Ignore our own bot logs like "✅ Linked Reddit..."
   if (lines[0].startsWith('✅ Linked Reddit') || lines[0].startsWith("I couldn't find a member")) {
     return null;
   }
@@ -132,7 +131,7 @@ function parseModmailMessageFromFullText(fullText) {
     redditName = namePart || null;
   }
 
-  // Fallback: if no Author line, use first non-empty line
+  // Fallback: use first non-empty line if we somehow didn't get an Author line
   if (!redditName) {
     redditName = stripMarkdown(lines[0]);
   }
@@ -144,15 +143,16 @@ function parseModmailMessageFromFullText(fullText) {
     let bodyPart = bodyLine.replace(/^body:\s*/i, '').trim();
     bodyPart = stripMarkdown(bodyPart);
 
-    // Match "Register Discord with Discord ID: something"
-    // or "Verify Discord: something"
+    // Match both:
+    // - Register Discord with Discord ID: xyz
+    // - Verify Discord: xyz
     const match = bodyPart.match(/discord(?:\s+with\s+discord\s+id)?:\s*([^\s]+)/i);
     if (match) {
       discordName = match[1].trim();
     }
   }
 
-  // 3) Status line → status
+  // 3) Status line → status (optional)
   const statusLine = lines.find(line => line.toLowerCase().startsWith('status:'));
   let status = 'Unknown';
   if (statusLine) {
@@ -177,7 +177,7 @@ function parseModmailMessageFromFullText(fullText) {
  * Find latest matching modmail within LOOKBACK_HOURS
  * Conditions:
  *  - redditName matches redditNameInput
- *  - discordName matches the user who typed !verify (username or globalName)
+ *  - discordName matches user's username or globalName
  *  - status is not banned
  */
 async function findMatchingModmail(modmailChannel, redditNameInput, member, lookbackHours) {
@@ -328,14 +328,31 @@ async function handleVerifyCommand(message) {
     return;
   }
 
-  // Set nickname
-  const newNick = `${redditName} | ${member.user.username}`;
+  // ---- Nickname logic with 32 char limit ----
+  // Build base nickname: "RedditName | DiscordName"
+  let newNick = `${redditName} | ${member.user.username}`;
+
+  // Discord limit: 32 characters for nickname
+  if (newNick.length > 32) {
+    // Prefer full Reddit name only
+    if (redditName.length <= 32) {
+      newNick = redditName;
+    } else {
+      // Truncate Reddit name if even it is too long
+      newNick = redditName.slice(0, 32);
+    }
+  }
+
   try {
     await member.setNickname(newNick);
-    console.log(`✅ Set nickname of ${member.user.tag} → ${newNick}`);
+    const updatedMember = await member.fetch();
+    console.log(
+      `✅ Requested nickname change for ${member.user.tag} → "${newNick}". ` +
+      `Server now reports displayName = "${updatedMember.displayName}"`
+    );
   } catch (err) {
     console.error('⚠️ Failed to set nickname:', err);
-    // Not fatal
+    // Not fatal; verification still succeeded
   }
 
   const redditProfileUrl = `https://www.reddit.com/u/${redditName}`;
@@ -344,7 +361,7 @@ async function handleVerifyCommand(message) {
     `✅ Successfully verified **u/${redditName}** ↔ **${member.user.username}**.\n` +
     `🔗 Reddit profile: <${redditProfileUrl}>\n` +
     `Modmail Discord ID on file: **${discordName}**\n` +
-    `Role assigned and nickname updated. Welcome!`
+    `Role assigned and nickname updated (or attempted). Welcome!`
   );
 }
 
@@ -367,12 +384,13 @@ async function handleRedditCommand(message) {
     return;
   }
 
-  const nickname = targetMember.displayName; // we set this to "RedditName | DiscordName"
-  if (!nickname || !nickname.includes('|')) {
+  const nickname = targetMember.displayName; // we set this to "RedditName | DiscordName" or "RedditName"
+  if (!nickname) {
     await message.reply('❌ That user does not have a Reddit-linked nickname.');
     return;
   }
 
+  // Expecting "RedditName | DiscordName" or just "RedditName"
   const redditNameRaw = nickname.split('|')[0].trim();
   const redditName = redditNameRaw.toLowerCase().startsWith('u/')
     ? redditNameRaw.slice(2)
@@ -425,8 +443,8 @@ client.on('messageCreate', async (message) => {
     try {
       await handleVerifyCommand(message);
     } catch (err) {
-        console.error('❌ Error handling !verify:', err);
-        await message.reply('⚠️ Something went wrong while verifying. Please try again or contact a mod.');
+      console.error('❌ Error handling !verify:', err);
+      await message.reply('⚠️ Something went wrong while verifying. Please try again or contact a mod.');
     }
     return;
   }
