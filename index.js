@@ -1,12 +1,33 @@
-// index.js – strict two-way verify: reddit name + Discord username/globalName must match
-// parses content from embeds + content
-// adds Reddit profile link on success
-// adds !reddit command usable in any channel (except modmail)
-// verify channel: only !verify allowed, other messages deleted
-// verify channel: slowmode applied on startup
+// index.js – Reddit ↔ Discord verification bot
+// - Strict two-way verification: Reddit name + Discord username/globalName must match
+// - Parses content from embeds + content
+// - Adds Reddit profile link on success
+// - Adds !reddit command usable in any channel (except modmail)
+// - Verify channel: only !verify allowed, other messages deleted
+// - Verify channel: slowmode applied on startup
 
 import dotenv from 'dotenv';
 dotenv.config();
+
+// ---- ENV validation ----
+const requiredEnv = [
+  'DISCORD_TOKEN',
+  'GUILD_ID',
+  'WATCH_CHANNEL_ID',
+  'VERIFY_COMMAND_CHANNEL_ID',
+  'ROLE_ID',
+];
+
+const missing = requiredEnv.filter((key) => !process.env[key]);
+
+if (missing.length > 0) {
+  console.error('❌ Missing required environment variables:');
+  for (const key of missing) {
+    console.error(`   - ${key}`);
+  }
+  console.error('💡 Copy .env.example to .env and fill in your real values.');
+  process.exit(1);
+}
 
 import {
   Client,
@@ -29,7 +50,6 @@ const MODMAIL_CHANNEL_ID = process.env.WATCH_CHANNEL_ID;              // forward
 const VERIFY_CHANNEL_ID = process.env.VERIFY_COMMAND_CHANNEL_ID;      // !verify channel
 const ROLE_ID = process.env.ROLE_ID;
 const LOOKBACK_HOURS = Number(process.env.MODMAIL_LOOKBACK_HOURS || '12');
-// slowmode in seconds for verify channel
 const VERIFY_SLOWMODE_SECONDS = Number(process.env.VERIFY_SLOWMODE_SECONDS || '30');
 
 // ---- Helpers ----
@@ -405,8 +425,8 @@ client.on('messageCreate', async (message) => {
     try {
       await handleVerifyCommand(message);
     } catch (err) {
-      console.error('❌ Error handling !verify:', err);
-      await message.reply('⚠️ Something went wrong while verifying. Please try again or contact a mod.');
+        console.error('❌ Error handling !verify:', err);
+        await message.reply('⚠️ Something went wrong while verifying. Please try again or contact a mod.');
     }
     return;
   }
