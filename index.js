@@ -292,9 +292,9 @@ async function handleVerifyCommand(message) {
 
   const match = await findMatchingModmail(modmailChannel, redditNameInput, member, LOOKBACK_HOURS);
 
-  if (!match) {
-    // Build a pre-filled modmail link for this user
+    if (!match) {
     const encodedDiscord = encodeURIComponent(member.user.username);
+
     const modmailUrl =
       `https://www.reddit.com/message/compose?to=r/PokemonGoTrade` +
       `&subject=Register%20to%20discord` +
@@ -303,7 +303,7 @@ async function handleVerifyCommand(message) {
     await message.reply(
       `❌ I couldn't find a recent modmail that links **u/${redditNameInput}** to your Discord username/global name within the last **${LOOKBACK_HOURS} hours**.\n\n` +
       `Please verify using this link (it will auto-fill the correct message):\n` +
-      `<${modmailUrl}>\n\n` +
+      `[Click here to send modmail](${modmailUrl})\n\n` +
       `Or manually send a modmail in this exact format:\n` +
       `\`Register Discord with Discord ID: ${member.user.username}\`\n` +
       `If you use a global display name, you may also use that instead.\n\n` +
