@@ -293,13 +293,21 @@ async function handleVerifyCommand(message) {
   const match = await findMatchingModmail(modmailChannel, redditNameInput, member, LOOKBACK_HOURS);
 
   if (!match) {
+    // Build a pre-filled modmail link for this user
+    const encodedDiscord = encodeURIComponent(member.user.username);
+    const modmailUrl =
+      `https://www.reddit.com/message/compose?to=r/PokemonGoTrade` +
+      `&subject=Register%20to%20discord` +
+      `&message=Register%20Discord%20with%20Discord%20ID:%20${encodedDiscord}`;
+
     await message.reply(
-      `❌ I couldn't find a recent modmail that links **u/${redditNameInput}** to **your Discord username/global name** within the last **${LOOKBACK_HOURS} hours**.\n\n` +
-      `Please:\n` +
-      `1. Send a modmail in the exact format:\n` +
-      `   \`Register Discord with Discord ID: ${member.user.username}\`\n` +
-      `2. If you use a global display name, you can also use that instead.\n` +
-      `3. Wait a few minutes, then run \`!verify ${redditNameInput}\` again in this channel.`
+      `❌ I couldn't find a recent modmail that links **u/${redditNameInput}** to your Discord username/global name within the last **${LOOKBACK_HOURS} hours**.\n\n` +
+      `Please verify using this link (it will auto-fill the correct message):\n` +
+      `<${modmailUrl}>\n\n` +
+      `Or manually send a modmail in this exact format:\n` +
+      `\`Register Discord with Discord ID: ${member.user.username}\`\n` +
+      `If you use a global display name, you may also use that instead.\n\n` +
+      `After sending the modmail, wait a few minutes, then run \`!verify ${redditNameInput}\` again in this channel — **make sure you are verifying your *Reddit* name**.`
     );
     return;
   }
@@ -408,7 +416,8 @@ async function handleRedditCommand(message) {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  const contentLower = message.content.trim().toLowerCase();
+  const raw = message.content || '';
+  const contentLower = raw.trim().toLowerCase();
 
   // Modmail channel: just log, no commands
   if (message.channelId === MODMAIL_CHANNEL_ID) {
@@ -416,7 +425,7 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // !reddit command – allowed in any channel (except modmail)
+  // !reddit command – allowed in any channel except modmail
   if (contentLower.startsWith('!reddit')) {
     try {
       await handleRedditCommand(message);
