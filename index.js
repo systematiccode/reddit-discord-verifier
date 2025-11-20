@@ -337,18 +337,12 @@ async function handleVerifyCommand(message) {
   }
 
   // ---- Nickname logic with 32 char limit ----
-  // Build base nickname: "RedditName | DiscordName"
-  let newNick = `${redditName} | ${member.user.username}`;
+  // Build base nickname: "RedditName"
+  let newNick = `${redditName}`;
 
-  // Discord limit: 32 characters for nickname
+  // Prefer full Reddit name only
   if (newNick.length > 32) {
-    // Prefer full Reddit name only
-    if (redditName.length <= 32) {
-      newNick = redditName;
-    } else {
-      // Truncate Reddit name if even it is too long
-      newNick = redditName.slice(0, 32);
-    }
+    newNick = redditName.slice(0, 32);
   }
 
   try {
